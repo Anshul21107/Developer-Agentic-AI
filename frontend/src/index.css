@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  background: radial-gradient(circle at top left, rgba(59, 130, 246, 0.15), transparent 45%),
+    radial-gradient(circle at 30% 30%, rgba(236, 72, 153, 0.12), transparent 50%),
+    #020617;
+}
+
+.markdown > :first-child {
+  margin-top: 0;
+}
+
+.markdown > :last-child {
+  margin-bottom: 0;
+}
