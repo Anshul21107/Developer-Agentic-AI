@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
@@ -9,10 +9,12 @@ import {
   fetchDocuments,
   listSessions,
   uploadRagDocuments,
-  streamChat,
+  connectWebSocket,
+  sendMessage,
   Message,
   Session,
-  SessionDocument
+  SessionDocument,
+  WsEvent
 } from "./services/api";
 
 type StreamState = "idle" | "streaming";
@@ -146,6 +148,7 @@ export default function App() {
   const streamBufferRef = useRef("");
   const streamAgentRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
   const istFormatter = useMemo(
     () =>
       new Intl.DateTimeFormat("en-IN", {
@@ -161,6 +164,7 @@ export default function App() {
     [sessions, activeSessionId]
   );
 
+  // Load sessions on mount
   useEffect(() => {
     listSessions()
       .then((data) => {
@@ -172,6 +176,7 @@ export default function App() {
       .catch((err) => setError(err.message));
   }, []);
 
+  // Load messages & documents when session changes
   useEffect(() => {
     if (!activeSessionId) {
       setMessages([]);
@@ -186,10 +191,12 @@ export default function App() {
       .catch((err) => setError(err.message));
   }, [activeSessionId]);
 
+  // Auto-scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streamBuffer]);
 
+  // Greeting
   useEffect(() => {
     const formatter = new Intl.DateTimeFormat("en-US", {
       hour: "numeric",
@@ -205,6 +212,93 @@ export default function App() {
       setGreeting("Evening");
     }
   }, []);
+
+  // WebSocket connection lifecycle
+  const connectWs = useCallback((sessionId: string) => {
+    // Close any existing connection
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
+    const ws = connectWebSocket(sessionId);
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data) as WsEvent;
+        if (data.type === "assistant_start") {
+          streamBufferRef.current = "";
+          setStreamBuffer("");
+          setStreamAgent(null);
+          streamAgentRef.current = null;
+        } else if (data.type === "assistant_token") {
+          streamBufferRef.current += data.content;
+          setStreamBuffer(streamBufferRef.current);
+        } else if (data.type === "assistant_end") {
+          const agent = data.agent;
+          setStreamAgent(agent);
+          streamAgentRef.current = agent;
+
+          // Finalize message
+          setStreamState("idle");
+          if (streamBufferRef.current.trim().length > 0) {
+            const assistantMessage: Message = {
+              id: crypto.randomUUID(),
+              session_id: sessionId,
+              role: "assistant",
+              content: streamBufferRef.current,
+              agent: agent ?? null,
+              timestamp: new Date().toISOString()
+            };
+            setMessages((prev) => [...prev, assistantMessage]);
+            setStreamBuffer("");
+            setStreamAgent(null);
+            streamBufferRef.current = "";
+            streamAgentRef.current = null;
+          }
+          // Refresh sessions to pick up new title
+          listSessions()
+            .then(setSessions)
+            .catch((err) => setError(err.message));
+        }
+      } catch {
+        // ignore parse errors
+      }
+    };
+
+    ws.onerror = () => {
+      setStreamState("idle");
+      setError("WebSocket connection error");
+    };
+
+    ws.onclose = () => {
+      // Only clear ref, don't show error for normal closes
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
+    };
+
+    wsRef.current = ws;
+  }, []);
+
+  // Connect WebSocket when active session changes
+  useEffect(() => {
+    if (activeSessionId) {
+      connectWs(activeSessionId);
+    } else {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    }
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, [activeSessionId, connectWs]);
+
   const handleNewChat = async () => {
     setError(null);
     setActiveSessionId(null);
@@ -249,6 +343,7 @@ export default function App() {
       setIsDeleting(false);
     }
   };
+
   const handleSend = async () => {
     if (!input.trim() || streamState === "streaming") return;
     const content = input.trim();
@@ -267,6 +362,9 @@ export default function App() {
         sessionId = session.id;
         setSessions((prev) => [session, ...prev]);
         setActiveSessionId(session.id);
+        // WebSocket will connect via useEffect when activeSessionId changes
+        // Wait briefly for the connection to be established
+        await new Promise((resolve) => setTimeout(resolve, 500));
       } catch (err) {
         setStreamState("idle");
         setError((err as Error).message);
@@ -278,52 +376,24 @@ export default function App() {
       setError("No session available.");
       return;
     }
-    const finalSessionId = sessionId;
 
     const tempMessage: Message = {
       id: crypto.randomUUID(),
-      session_id: finalSessionId,
+      session_id: sessionId,
       role: "user",
       content,
       timestamp: new Date().toISOString()
     };
     setMessages((prev) => [...prev, tempMessage]);
 
-    await streamChat(finalSessionId, content, {
-      onAgent: (agent) => {
-        setStreamAgent(agent);
-        streamAgentRef.current = agent;
-      },
-      onToken: (token) => {
-        streamBufferRef.current += token;
-        setStreamBuffer(streamBufferRef.current);
-      },
-      onDone: () => {
-        setStreamState("idle");
-        if (streamBufferRef.current.trim().length > 0) {
-          const assistantMessage: Message = {
-            id: crypto.randomUUID(),
-            session_id: finalSessionId,
-            role: "assistant",
-            content: streamBufferRef.current,
-            agent: streamAgentRef.current ?? null,
-            timestamp: new Date().toISOString()
-          };
-          setMessages((prev) => [...prev, assistantMessage]);
-          setStreamBuffer("");
-          setStreamAgent(null);
-          streamBufferRef.current = "";
-          streamAgentRef.current = null;
-        }
-        listSessions()
-          .then(setSessions)
-          .catch((err) => setError(err.message));
-      },
-      onError: (err) => {
-        setStreamState("idle");
-        setError(err.message);
-      }
-    });
+    // Send via WebSocket
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setStreamState("idle");
+      setError("WebSocket not connected. Please try again.");
+      return;
+    }
+    sendMessage(ws, content);
   };
 
   const handleUploadClick = () => {
@@ -349,7 +419,6 @@ export default function App() {
       if (!sessionId) {
         throw new Error("No session available for upload.");
       }
-      const fileNames = Array.from(files).map((file) => file.name);
       const result = await uploadRagDocuments(sessionId, files);
       if (result.status === "ok") {
         const refreshed = await fetchDocuments(sessionId);
@@ -422,7 +491,7 @@ export default function App() {
                           {session.title || "Untitled Chat"}
                         </p>
                         <p className="mt-1 text-xs text-slate-400">
-                          {istFormatter.format(new Date(session.created_at))}
+                          {istFormatter.format(new Date(session.updated_at ?? session.created_at))}
                         </p>
                       </div>
                       <button
@@ -493,9 +562,13 @@ export default function App() {
                     }`}
                   >
                     <div className="max-w-[80%]">
-                      {message.role === "assistant" && message.agent && message.agent !== "orchestrator" && (
-                        <div className="mb-2 inline-flex items-center rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-widest text-cyan-200">
-                          {message.agent.replace(/_/g, " ")}
+                      {message.role === "assistant" && message.agent && message.agent !== "orchestrator" && message.agent !== "general" && (
+                        <div className="mb-2 flex flex-wrap gap-1.5">
+                          {message.agent.split(",").filter(a => a.trim() && a.trim() !== "general" && a.trim() !== "orchestrator").map((agent) => (
+                            <span key={agent.trim()} className="inline-flex items-center rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-widest text-cyan-200">
+                              {agent.trim().replace(/_/g, " ")}
+                            </span>
+                          ))}
                         </div>
                       )}
                       <div
@@ -522,9 +595,13 @@ export default function App() {
                 {streamBuffer && (
                   <div className="flex w-full justify-start">
                     <div className="max-w-[80%]">
-                      {streamAgent && streamAgent !== "orchestrator" && (
-                        <div className="mb-2 inline-flex items-center rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-widest text-cyan-200">
-                          {streamAgent.replace(/_/g, " ")}
+                      {streamAgent && streamAgent !== "orchestrator" && streamAgent !== "general" && (
+                        <div className="mb-2 flex flex-wrap gap-1.5">
+                          {streamAgent.split(",").filter(a => a.trim() && a.trim() !== "general" && a.trim() !== "orchestrator").map((agent) => (
+                            <span key={agent.trim()} className="inline-flex items-center rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-widest text-cyan-200">
+                              {agent.trim().replace(/_/g, " ")}
+                            </span>
+                          ))}
                         </div>
                       )}
                       <div className="rounded-2xl border border-slate-800 bg-slate-900/50 px-6 py-4 text-sm leading-relaxed text-slate-200">

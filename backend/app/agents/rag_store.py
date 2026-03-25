@@ -1,4 +1,8 @@
 import os
+
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
+os.environ.setdefault("CHROMA_TELEMETRY", "false")
+
 from pathlib import Path
 from typing import Iterable
 

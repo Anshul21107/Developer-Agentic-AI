@@ -24,6 +24,7 @@ class Session(Base):
     title = Column(String, nullable=True)
     memory_summary = Column(Text, nullable=True)
     created_at = Column(DateTime, default=_ist_now)
+    updated_at = Column(DateTime, default=_ist_now, onupdate=_ist_now)
 
     messages = relationship("Message", back_populates="session", cascade="all, delete-orphan")
     documents = relationship(
@@ -71,3 +72,14 @@ class SessionEmail(Base):
     sent_at = Column(DateTime, nullable=True)
 
     session = relationship("Session", back_populates="emails")
+
+
+class UserFact(Base):
+    """Persistent user facts for personalization (name, location, preferences, etc.)."""
+    __tablename__ = "user_facts"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    key = Column(String, nullable=False, unique=True, index=True)
+    value = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=_ist_now)
+    updated_at = Column(DateTime, default=_ist_now, onupdate=_ist_now)

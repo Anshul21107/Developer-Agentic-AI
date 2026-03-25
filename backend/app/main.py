@@ -1,24 +1,26 @@
+import warnings
+warnings.filterwarnings("ignore", message=".*deprecated.*")
+
 import json
-import re
 from io import BytesIO
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .agents.graph import agent_graph
 from .agents.memory_agent import update_memory_summary
+from .agents.memory_extractor import extract_and_store_facts
 from .agents.rag_store import ingest_texts, has_documents
-from .agents.web_search_agent import web_search_tool_node
 from .db import Base, SessionLocal, engine, get_db
 from .llm import get_llm
-from .models import Message, Session as ChatSession, SessionDocument, SessionEmail
+from .models import Message, Session as ChatSession, SessionDocument, SessionEmail, UserFact
 from .schemas import ChatRequest, DocumentRead, MessageRead, SessionRead
+from .websocket_manager import manager
 
 load_dotenv()
 
@@ -38,6 +40,7 @@ def on_startup():
     Base.metadata.create_all(bind=engine)
     _ensure_column("messages", "agent", "VARCHAR")
     _ensure_column("sessions", "memory_summary", "TEXT")
+    _ensure_column("sessions", "updated_at", "DATETIME")
 
     with engine.begin() as conn:
         conn.execute(
@@ -67,6 +70,11 @@ def _ensure_column(table: str, column: str, column_type: str) -> None:
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"))
 
 
+# ---------------------------------------------------------------------------
+# Session CRUD  (unchanged)
+# ---------------------------------------------------------------------------
+
+
 @app.post("/sessions", response_model=SessionRead)
 def create_session(db: Session = Depends(get_db)):
     session = ChatSession(title=None)
@@ -78,7 +86,12 @@ def create_session(db: Session = Depends(get_db)):
 
 @app.get("/sessions", response_model=list[SessionRead])
 def list_sessions(db: Session = Depends(get_db)):
-    return db.query(ChatSession).order_by(ChatSession.created_at.desc()).all()
+    from sqlalchemy import func
+    return (
+        db.query(ChatSession)
+        .order_by(func.coalesce(ChatSession.updated_at, ChatSession.created_at).desc())
+        .all()
+    )
 
 
 @app.get("/sessions/{session_id}/messages", response_model=list[MessageRead])
@@ -117,6 +130,11 @@ def delete_session(session_id: str, db: Session = Depends(get_db)):
     return {"status": "deleted"}
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
 async def _generate_title(user_message: str) -> str:
     llm = get_llm(streaming=False)
     prompt = (
@@ -128,117 +146,6 @@ async def _generate_title(user_message: str) -> str:
     return result.content.strip().strip('"')
 
 
-def _to_lc_messages(messages: list[Message]):
-    lc_messages = []
-    for msg in messages:
-        if msg.role == "user":
-            lc_messages.append(HumanMessage(content=msg.content))
-        else:
-            lc_messages.append(AIMessage(content=msg.content))
-    return lc_messages
-
-
-@app.post("/chat/{session_id}/stream")
-async def chat_stream(session_id: str, request: ChatRequest):
-    db = SessionLocal()
-    try:
-        session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-
-        user_message = Message(session_id=session_id, role="user", content=request.message)
-        db.add(user_message)
-        db.commit()
-
-        message_count = (
-            db.query(Message).filter(Message.session_id == session_id).count()
-        )
-        if message_count == 1 and not session.title:
-            try:
-                session.title = await _generate_title(request.message)
-                db.commit()
-            except Exception:
-                db.rollback()
-
-        history = (
-            db.query(Message)
-            .filter(Message.session_id == session_id)
-            .order_by(Message.timestamp.asc())
-            .all()
-        )
-        lc_messages = _to_lc_messages(history)
-
-        memory_summary = session.memory_summary
-        agent_state = await agent_graph.ainvoke(
-            {
-                "session_id": session_id,
-                "user_input": request.message,
-                "memory_summary": memory_summary,
-                "has_documents": has_documents(session_id),
-                "has_pending_email": _has_pending_email(session_id, db),
-            }
-        )
-        agent_name = agent_state.get("agent")
-        tool_context = agent_state.get("tool_context", "")
-
-        if not agent_name:
-            gate = await _should_use_web_search(request.message)
-            if gate.get("requires_web_search"):
-                web_state = await web_search_tool_node({"user_input": request.message})
-                agent_name = web_state.get("agent")
-                tool_context = web_state.get("tool_context", "")
-
-        system_prompt = _build_system_prompt(
-            agent_name=agent_name or "general",
-            tool_context=tool_context,
-            memory_summary=memory_summary,
-        )
-        lc_messages.insert(0, SystemMessage(content=system_prompt))
-
-        async def event_generator():
-            chunks: list[str] = []
-            try:
-                if agent_name:
-                    yield f"data: {json.dumps({'agent': agent_name})}\n\n"
-                if agent_name in {"email_agent", "web_search_agent", "weather_agent", "news_agent"} and tool_context:
-                    chunks.append(tool_context)
-                    yield f"data: {json.dumps({'token': tool_context})}\n\n"
-                else:
-                    llm = get_llm(streaming=True)
-                    async for chunk in llm.astream(lc_messages):
-                        token = getattr(chunk, "content", "") or ""
-                        if not token:
-                            continue
-                        chunks.append(token)
-                        payload = json.dumps({"token": token})
-                        yield f"data: {payload}\n\n"
-            finally:
-                assistant_text = "".join(chunks).strip()
-                if assistant_text:
-                    assistant_message = Message(
-                        session_id=session_id,
-                        role="assistant",
-                        content=assistant_text,
-                        agent=agent_name if agent_name else None,
-                    )
-                    db.add(assistant_message)
-                    db.commit()
-                    try:
-                        session.memory_summary = await update_memory_summary(
-                            session.memory_summary, request.message, assistant_text
-                        )
-                        db.commit()
-                    except Exception:
-                        db.rollback()
-                yield "data: [DONE]\n\n"
-                db.close()
-
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
-    except Exception:
-        db.close()
-        raise
-
-
 def _has_pending_email(session_id: str, db: Session) -> bool:
     return (
         db.query(SessionEmail)
@@ -248,56 +155,152 @@ def _has_pending_email(session_id: str, db: Session) -> bool:
     )
 
 
-def _build_system_prompt(
-    agent_name: str, tool_context: str, memory_summary: str | None
-) -> str:
-    prompt_parts = [
-        "You are a helpful assistant in an agentic chatbot.",
-    ]
-    if memory_summary:
-        prompt_parts.append(f"Conversation summary:\n{memory_summary}")
-    if agent_name == "rag_agent":
-        prompt_parts.append(
-            "Use the provided context when answering. If the context is missing, "
-            "say what you do not know and ask a follow-up question."
-        )
-    if agent_name == "weather_agent":
-        prompt_parts.append(
-            "Answer as a weather assistant using the provided weather context."
-        )
-    if agent_name == "news_agent":
-        prompt_parts.append(
-            "Answer as a news assistant. Use the summarized bullets provided."
-        )
-    if agent_name == "web_search_agent":
-        prompt_parts.append(
-            "Answer as a web search assistant. Use only the provided summary."
-        )
-    if tool_context:
-        prompt_parts.append(f"Context:\n{tool_context}")
-    return "\n\n".join(prompt_parts)
+# ---------------------------------------------------------------------------
+# WebSocket chat endpoint
+# ---------------------------------------------------------------------------
 
 
-async def _should_use_web_search(user_message: str) -> dict:
-    llm = get_llm(streaming=False)
-    prompt = (
-        "Answer the question. If you are not confident or the answer may require "
-        "up-to-date information, set requires_web_search=true.\n\n"
-        "Return ONLY valid JSON with keys: answer, requires_web_search.\n\n"
-        f"Question: {user_message}"
-    )
-    result = await llm.ainvoke(prompt)
-    content = (result.content or "").strip()
+@app.websocket("/ws/chat/{session_id}")
+async def websocket_chat(websocket: WebSocket, session_id: str):
+    db = SessionLocal()
     try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", content, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                pass
-    return {"answer": "", "requires_web_search": False}
+        session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+        if not session:
+            await websocket.close(code=4004, reason="Session not found")
+            return
+
+        await manager.connect(session_id, websocket)
+
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                if payload.get("type") != "user_message":
+                    continue
+
+                user_content = (payload.get("content") or "").strip()
+                if not user_content:
+                    continue
+
+                # Store user message and bump session to top
+                from .models import _ist_now
+                user_msg = Message(session_id=session_id, role="user", content=user_content)
+                db.add(user_msg)
+                session.updated_at = _ist_now()
+                db.commit()
+
+                # Auto-generate title on first message
+                message_count = db.query(Message).filter(Message.session_id == session_id).count()
+                if message_count == 1 and not session.title:
+                    try:
+                        session.title = await _generate_title(user_content)
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+
+                # Build conversation history as LangChain messages (last 20 for speed)
+                history = (
+                    db.query(Message)
+                    .filter(Message.session_id == session_id)
+                    .order_by(Message.timestamp.desc())
+                    .limit(20)
+                    .all()
+                )
+                history.reverse()
+                lc_messages = []
+                for msg in history:
+                    if msg.role == "user":
+                        lc_messages.append(HumanMessage(content=msg.content))
+                    else:
+                        lc_messages.append(AIMessage(content=msg.content))
+
+                # Refresh session to get latest memory
+                db.refresh(session)
+                memory_summary = session.memory_summary
+
+                # Run planner loop (tools execute in parallel inside)
+                agent_state = await agent_graph.ainvoke(
+                    {
+                        "messages": lc_messages,
+                        "session_id": session_id,
+                        "memory_summary": memory_summary,
+                        "has_documents": has_documents(session_id),
+                        "has_pending_email": _has_pending_email(session_id, db),
+                    }
+                )
+
+                # Extract final AI response
+                final_messages = agent_state.get("messages", [])
+                last_ai = None
+                for m in reversed(final_messages):
+                    if isinstance(m, AIMessage) and m.content:
+                        last_ai = m
+                        break
+
+                assistant_text = last_ai.content.strip() if last_ai else ""
+                agent_label = agent_state.get("agent_label") or "general"
+
+                # Stream the response word-by-word
+                if assistant_text:
+                    await manager.send_json(session_id, {"type": "assistant_start"})
+
+                    words = assistant_text.split(" ")
+                    for i, word in enumerate(words):
+                        token = word if i == 0 else " " + word
+                        await manager.send_json(
+                            session_id, {"type": "assistant_token", "content": token}
+                        )
+
+                    await manager.send_json(
+                        session_id, {"type": "assistant_end", "agent": agent_label}
+                    )
+
+                    # Store assistant message
+                    assistant_msg = Message(
+                        session_id=session_id,
+                        role="assistant",
+                        content=assistant_text,
+                        agent=agent_label,
+                    )
+                    db.add(assistant_msg)
+                    db.commit()
+
+                    # Update memory summary
+                    try:
+                        session.memory_summary = await update_memory_summary(
+                            session.memory_summary, user_content, assistant_text
+                        )
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+
+                    # Extract personal facts in background (non-blocking)
+                    import asyncio
+
+                    def _log_bg_error(task):
+                        if task.exception():
+                            logging.getLogger(__name__).debug(
+                                f"Fact extraction error: {task.exception()}"
+                            )
+
+                    bg = asyncio.create_task(
+                        extract_and_store_facts(user_content, assistant_text)
+                    )
+                    bg.add_done_callback(_log_bg_error)
+
+        except WebSocketDisconnect:
+            manager.disconnect(session_id)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# RAG upload  (unchanged)
+# ---------------------------------------------------------------------------
 
 
 def _extract_text_from_upload(filename: str, data: bytes) -> str | None:
@@ -344,3 +347,26 @@ async def upload_rag(
         db.add(SessionDocument(session_id=session_id, filename=filename))
     db.commit()
     return {"status": "ok", "skipped": skipped, "chunks": chunks}
+
+
+# ---------------------------------------------------------------------------
+# User personalization facts
+# ---------------------------------------------------------------------------
+
+
+@app.get("/user/facts")
+def get_user_facts(db: Session = Depends(get_db)):
+    """Return all stored user facts."""
+    facts = db.query(UserFact).order_by(UserFact.key).all()
+    return [{"key": f.key, "value": f.value, "updated_at": str(f.updated_at)} for f in facts]
+
+
+@app.delete("/user/facts/{key}")
+def delete_user_fact(key: str, db: Session = Depends(get_db)):
+    """Delete a specific user fact by key."""
+    fact = db.query(UserFact).filter(UserFact.key == key).first()
+    if not fact:
+        raise HTTPException(status_code=404, detail="Fact not found")
+    db.delete(fact)
+    db.commit()
+    return {"status": "deleted", "key": key}

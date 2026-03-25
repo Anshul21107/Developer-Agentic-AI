@@ -62,6 +62,11 @@ yarn-debug.log*
 yarn-error.log*
 
 # ========================
+# RAG Storage (ChromaDB data)
+# ========================
+backend/app/storage/
+
+# ========================
 # Misc
 # ========================
 *.bak

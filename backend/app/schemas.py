@@ -14,6 +14,7 @@ class SessionRead(BaseModel):
     title: str | None = None
     memory_summary: str | None = None
     created_at: datetime
+    updated_at: datetime | None = None
 
 
 class MessageRead(BaseModel):

@@ -1,9 +1,11 @@
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+const WS_URL = import.meta.env.VITE_WS_URL ?? "ws://localhost:8000";
 
 export type Session = {
   id: string;
   title: string | null;
   created_at: string;
+  updated_at: string | null;
 };
 
 export type Message = {
@@ -21,6 +23,10 @@ export type SessionDocument = {
   filename: string;
   uploaded_at: string;
 };
+
+// ---------------------------------------------------------------------------
+// REST endpoints (unchanged)
+// ---------------------------------------------------------------------------
 
 export async function createSession(): Promise<Session> {
   const res = await fetch(`${API_URL}/sessions`, { method: "POST" });
@@ -88,66 +94,19 @@ export async function uploadRagDocuments(
   return res.json();
 }
 
-type StreamHandlers = {
-  onToken: (token: string) => void;
-  onDone: () => void;
-  onError: (error: Error) => void;
-  onAgent?: (agent: string) => void;
-};
+// ---------------------------------------------------------------------------
+// WebSocket
+// ---------------------------------------------------------------------------
 
-export async function streamChat(
-  sessionId: string,
-  message: string,
-  handlers: StreamHandlers
-) {
-  try {
-    const res = await fetch(`${API_URL}/chat/${sessionId}/stream`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ message })
-    });
+export function connectWebSocket(sessionId: string): WebSocket {
+  return new WebSocket(`${WS_URL}/ws/chat/${sessionId}`);
+}
 
-    if (!res.ok || !res.body) {
-      throw new Error("Failed to start stream");
-    }
+export type WsEvent =
+  | { type: "assistant_start" }
+  | { type: "assistant_token"; content: string }
+  | { type: "assistant_end"; agent: string };
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const events = buffer.split("\n\n");
-      buffer = events.pop() ?? "";
-
-      for (const event of events) {
-        const line = event.split("\n").find((item) => item.startsWith("data: "));
-        if (!line) continue;
-        const data = line.replace("data: ", "").trim();
-        if (data === "[DONE]") {
-          handlers.onDone();
-          return;
-        }
-        try {
-          const payload = JSON.parse(data) as { token?: string; agent?: string };
-          if (payload.agent && handlers.onAgent) {
-            handlers.onAgent(payload.agent);
-          }
-          if (payload.token) {
-            handlers.onToken(payload.token);
-          }
-        } catch (err) {
-          handlers.onError(new Error("Invalid stream payload"));
-        }
-      }
-    }
-
-    handlers.onDone();
-  } catch (err) {
-    handlers.onError(err as Error);
-  }
+export function sendMessage(ws: WebSocket, content: string): void {
+  ws.send(JSON.stringify({ type: "user_message", content }));
 }
